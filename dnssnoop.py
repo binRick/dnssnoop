@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, json, time, traceback, struct
+import sys, json, time, traceback, struct, psutil
 from scapy.all import *
 import ctypes as ct
 import threading
@@ -7,8 +7,35 @@ from queue import Queue
 import datetime
 from bcc import BPF
 
+DEBUG_MODE = False
+
 def ip_to_string(ip):
     return ".".join(map(lambda n: str(ip>>n & 0xff), [24,16,8,0]))
+
+
+def crawl_process_tree(proc):
+    procs = [proc]
+    while True:
+        ppid = procs[len(procs)-1].ppid()
+        if ppid == 0:
+            break
+        procs.append(psutil.Process(ppid))
+    return procs
+
+def check_proc(pid):
+    try:
+        proc = psutil.Process(pid)
+        proctree = crawl_process_tree(proc)
+        proctree_enriched = list({"pid": p.pid, "cmdline": " ".join(p.cmdline()), "username":  p.username()} for p in proctree)
+        return proctree_enriched
+    except Exception as e:
+        traceback.print_exc()
+        return None
+
+#PID = 14172
+#print(crawl_process_tree(psutil.Process(PID)))
+#print(check_proc(PID))
+
 
 bpf_prog = r'''
 #include <linux/sched.h>
@@ -58,7 +85,7 @@ def get_cmd_for(pid):
 
 def process_data():
   while True:
-    dport, sport, dns = DNS_Q.get()
+    dport, sport, dns, query = DNS_Q.get()
     m = [x.pid for x in RING if x.sport == sport]
     if m:
       pid = m[0]
@@ -74,7 +101,11 @@ def process_data():
         'sport': int(sport),
         'dport': int(dport),
         'q': '{}'.format(dns.q),
+        #'query': '{}'.format(query),
+        'check_proc': False,
     }
+    if J['pid'] > 0:
+        J['check_proc'] = check_proc(J['pid'])
     print(json.dumps(J))
     #f'{dt} {pid:5} {cmd[:50]:50} {dns.q}')
 
@@ -89,7 +120,8 @@ def on_data(cpu, data, size):
   event = ct.cast(data, ct.POINTER(Data)).contents
   RING[RING_pos] = event
   RING_pos = (RING_pos + 1) % RING_size
-#  print('on_data...cpu={}, data={}, size={}, event={}, pos={}, '.format(cpu,data,size,event, RING_pos))
+  if DEBUG_MODE:
+    print('on_data...cpu={}, data={}, size={}, event={}, pos={}, '.format(cpu,data,size,event, RING_pos))
 
 def main():
   b = BPF(text=bpf_prog)
@@ -125,21 +157,22 @@ def handle_packet(pkt):
     # 28 = 20B IPv4 header + 8B UDP header
     dns = DNSRecord.parse(ip[28:])
     dport = 4
-    q = PKT[DNSQR].qname
+    query = PKT[DNSQR].qname
     qt = PKT[DNSQR].qtype
-    an = 2 #PKT[DNSQR].an
-    an_qty = 3 #PKT[DNSQR].ancount
-    print('dport={}, sport={}, payload_len={}, '.format(dport,sport,payload_len))
-    print('tcp={},udp={},dns_rr={},qr={},q={},qt={},an={},an_qty={},'.format(
+    an = 3 #PKT[DNSQR].an
+    an_qty = 2 #PKT[DNSQR].ancount
+    if DEBUG_MODE:
+      print('dport={}, sport={}, payload_len={}, '.format(dport,sport,payload_len))
+      print('tcp={},udp={},dns_rr={},qr={},query={},qt={},an={},an_qty={},'.format(
         PKT.haslayer(TCP),
         PKT.haslayer(UDP),
         PKT.haslayer(DNSRR),
         False,
-        q,qt,an,an_qty,
-    ))
+        query,qt,an,an_qty,
+      ))
 #    if PKT.haslayer(UDP):
 #        dport = pkt.getlayer(UDP).dport
-    DNS_Q.put((dport, sport, dns))
+    DNS_Q.put((dport, sport, dns,  query))
   finally:
     pkt.accept()
 
